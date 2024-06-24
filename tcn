@@ -1,0 +1,170 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import utils
+import readdata_3
+import torch.utils.data.dataloader as DataLoader
+import os
+import sys
+from sklearn.metrics import confusion_matrix
+sys.path.append("..")
+import LOG
+
+logger = LOG.get_log('TCN')
+
+class Chomp1d(nn.Module):   # 裁剪多余的padding
+    def __init__(self, chomp_size):
+        super(Chomp1d, self).__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        return x[:, :, :-self.chomp_size].contiguous()
+
+class TemporalBlock(nn.Module):
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
+        super(TemporalBlock, self).__init__()
+        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                               stride=stride, padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                               stride=stride, padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
+                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.relu = nn.ReLU()
+        self.init_weights()
+
+    def init_weights(self):
+        self.conv1.weight.data.normal_(0, 0.01)
+        self.conv2.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+class TemporalConvNet(nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=9, dropout=0.2):
+        super(TemporalConvNet, self).__init__()
+        layers = []
+        num_levels = len(num_channels)
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i - 1]
+            out_channels = num_channels[i]
+            layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation_size,
+                                     padding=(kernel_size - 1) * dilation_size, dropout=dropout)]
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+class FrFT_TCN(nn.Module):
+    def __init__(self, input_size=1, output_size=3, num_channels=[8 ,16 , 32], kernel_size=9, dropout=0.2):
+        super(FrFT_TCN, self).__init__()
+        self.tcn = TemporalConvNet(input_size, num_channels, kernel_size=kernel_size, dropout=dropout)
+        self.classifier1 = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_size)
+        )
+
+    def forward(self, x):
+        x = self.tcn(x)
+        x = x.mean(dim=1)
+        x = self.classifier1(x)
+        return x
+
+def train(epoch):
+    utils.fix_randseed(2022)
+    print('\nEpoch: %d' % epoch)
+    net.train()
+    train_loss = 0
+    correct = 0
+    total = 0
+    for batch_idx, (inputs, targets) in enumerate(dataloader_train):
+        inputs, targets = inputs.to('cuda:0'), targets.to('cuda:0')
+
+        optimizer.zero_grad()
+        outputs = net(inputs)
+
+        loss = criterion(outputs, targets)
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)  # 裁剪梯度
+        optimizer.step()
+
+        train_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+        if (batch_idx % 1 == 0):
+            print(batch_idx, len(dataloader_train), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                  % (train_loss / (batch_idx + 1), 100. * correct / total, correct, total))
+
+def test(epoch):
+    utils.fix_randseed(2022)
+    global best_acc, file_path
+    net.eval()
+    test_loss = 0
+    correct = 0
+    total = 0
+    predict_all = np.array([], dtype=int)
+    labels_all = np.array([], dtype=int)
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(dataloader_test):
+            inputs, targets = inputs.to('cuda:0'), targets.to('cuda:0')
+            outputs = net(inputs)
+            loss = criterion(outputs, targets)
+            test_loss += loss.item()
+            _, predicted = outputs.max(1)
+            predic = predicted.cpu().numpy()
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+            labels_all = np.append(labels_all, targets.cpu().numpy())
+            predict_all = np.append(predict_all, predic)
+            print(batch_idx, len(dataloader_test), 'Test Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                  % (test_loss / (batch_idx + 1), 100. * correct / total, correct, total))
+        confusion = confusion_matrix(labels_all, predict_all)
+        best_acc = 100. * correct / total
+        epoch_loss = test_loss / (batch_idx + 1)
+        logger.info('epoch: %d | Test Loss: %.3f | Acc: %.3f%% '
+                    % (epoch, epoch_loss, best_acc))
+
+if __name__ == '__main__':
+    batch_size = 256
+    net = FrFT_TCN(input_size=1, output_size=3, num_channels=[8, 16, 32], kernel_size=9, dropout=0.2)
+    net = net.to('cuda:0')
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(net.parameters(), lr=0.0001)
+    datapath = './F310MHz-rao/'
+
+    dataset_train = readdata_3.subDataset(datapath=datapath, split='train', transform=None)
+    dataset_test = readdata_3.subDataset(datapath=datapath, split='valid', transform=None)
+
+    print(dataset_test.__len__())
+    print(dataset_train.__len__())
+    dataloader_train = DataLoader.DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=4)
+    dataloader_test = DataLoader.DataLoader(dataset_test, batch_size=batch_size, shuffle=False, num_workers=4)
+    print('Total params: %.2fM' % (sum(p.numel() for p in net.parameters()) / 1000000.0))
+    best_acc = 0
+    file_path = ''
+    step_n = 0
+    for epoch in range(100):
+        train(epoch)
+        test(epoch)
